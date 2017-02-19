@@ -1,11 +1,20 @@
 use std::io;
+use std::io::Cursor;
 use std::fmt;
 use std::str;
 use std::error;
 use std::fs::File;
 use std::io::prelude::*;
 
-use byteorder::{LittleEndian, ReadBytesExt};
+use byteorder::{ByteOrder, LittleEndian, ReadBytesExt};
+
+const CHUNK_DATA_OFFSET: usize = 8;
+
+#[derive(Debug)]
+struct Chunk {
+    id: String,
+    size: u32,
+}
 
 #[derive(Debug)]
 pub struct Wav {
@@ -19,6 +28,7 @@ pub struct Wav {
 
 #[derive(Debug)]
 pub enum WavData {
+    Unspecified,
     U8(Vec<u8>),
     I16(Vec<i16>),
     I32(Vec<i32>),
@@ -67,7 +77,27 @@ impl From<String> for WavLoadError {
     }
 }
 
+macro_rules! wav_assert {
+    ($a:expr, $msg:expr) => {
+        if !$a {
+            return Err(WavLoadError::Parse($msg));
+        }
+    }
+}
+
 impl Wav {
+
+    fn new() -> Wav {
+        Wav {
+            num_channels: 0,
+            sample_rate: 0,
+            byte_rate: 0,
+            block_align: 0,
+            bits_per_sample: 0,
+            data: WavData::Unspecified,
+        }
+    }
+
     pub fn from_file(path: &str) -> Result<Wav, WavLoadError> {
         let mut f = try!(File::open(path));
         let mut buf = Vec::new();
@@ -76,55 +106,35 @@ impl Wav {
         Wav::buf_to_wav(&mut buf)
     }
 
-    fn buf_to_wav(buf: &[u8]) -> Result<Wav, WavLoadError> {
-        macro_rules! wav_assert_eq {
-            ($a:expr, $b:expr, $msg:expr) => {
-                if $a != $b {
-                    return Err(WavLoadError::Parse($msg));
-                }
-            }
+    fn parse_chunk(buf: &[u8]) -> Option<Chunk> {
+        if buf.len() < 8 {
+            None
+        } else {
+            let mut chunk_id = str::from_utf8(&buf[0..4]).unwrap().to_string();
+            let chunk_size = LittleEndian::read_u32(&buf[4..8]);
+
+            Some(Chunk {
+                id: chunk_id,
+                size: chunk_size,
+            })
         }
+    }
 
-        if buf.len() < 44 {
-            return Err(WavLoadError::Parse("Incomplete header".to_string()));
-        }
+    fn parse_fmt_chunk_data(buf: &[u8], wav: &mut Wav) -> Result<(), WavLoadError> {
+        let mut reader = Cursor::new(buf);
+        let audio_format = try!(reader.read_u16::<LittleEndian>());
+        wav_assert!(audio_format == 1, "Audio format is not PCM".to_string());
+        wav.num_channels = try!(reader.read_u16::<LittleEndian>());
+        wav.sample_rate = try!(reader.read_u32::<LittleEndian>());
+        wav.byte_rate = try!(reader.read_u32::<LittleEndian>());
+        wav.block_align = try!(reader.read_u16::<LittleEndian>());
+        wav.bits_per_sample = try!(reader.read_u16::<LittleEndian>());
+        Ok(())
+    }
 
-        let mut reader = io::Cursor::new(&buf);
-        let chunk_id = str::from_utf8(&buf[0..4]).unwrap();
-        wav_assert_eq!(chunk_id, "RIFF", format!("Unsupported wave file (got: \"{}\", expected \"RIFF\")", chunk_id));
-        
-        //Advance the reader until after the chunk_id
-        reader.set_position(4);
-        let chunk_size = reader.read_u32::<LittleEndian>().unwrap();
-        wav_assert_eq!(chunk_size as usize, buf.len() - 8, format!("actual file size does not match reported size (got: \"{}\", expected \"{}\")", chunk_size, buf.len() - 8));
-
-        let format = str::from_utf8(&buf[8..12]).unwrap();
-        wav_assert_eq!(format, "WAVE", format!("Unsupported format (got: \"{}\", expected \"WAVE\")", format));
-
-        let sub_chunk_1_id = str::from_utf8(&buf[12..16]).unwrap();
-        wav_assert_eq!(sub_chunk_1_id, "fmt ", format!("sub chunk 1 has unknown format (got: \"{}\", expected \"WAVE\")", sub_chunk_1_id));
-
-        reader.set_position(16);
-        let sub_chunk_1_size = reader.read_u32::<LittleEndian>().unwrap();
-        wav_assert_eq!(sub_chunk_1_size, 16, format!("sub chunk 1 has invalid size (got: {}, expected 16)", sub_chunk_1_size)); 
-
-        let audio_format = reader.read_u16::<LittleEndian>().unwrap();
-        wav_assert_eq!(audio_format, 1, format!("Invalid audio format (got: {}, expected 1 (=PCM))", audio_format)); 
-
-        let num_channels = reader.read_u16::<LittleEndian>().unwrap();
-        let sample_rate = reader.read_u32::<LittleEndian>().unwrap();
-        let byte_rate = reader.read_u32::<LittleEndian>().unwrap();
-        let block_align = reader.read_u16::<LittleEndian>().unwrap();
-        let bits_per_sample = reader.read_u16::<LittleEndian>().unwrap();
-
-        let sub_chunk_2_id = str::from_utf8(&buf[36..40]).unwrap();
-        wav_assert_eq!(sub_chunk_2_id, "data", format!("sub chunk 2 has unknown format (got: \"{}\", expected \"data\")", sub_chunk_2_id));
-
-        reader.set_position(40);
-        let sub_chunk_2_size = reader.read_u32::<LittleEndian>().unwrap();
-        wav_assert_eq!(buf.len() - 44, sub_chunk_2_size as usize, format!("actual file size does not match reported size (got: \"{}\", expected \"{}\")", sub_chunk_2_size, buf.len() - 44));
-
-        let data_enum = match bits_per_sample {
+    fn parse_data_chunk_data(buf: &[u8], wav: &mut Wav) -> Result<(), WavLoadError> {
+        let mut reader = Cursor::new(buf);
+        let data_enum = match wav.bits_per_sample {
             8 => {
                 let mut data = Vec::new();
                 while let Ok(val) = reader.read_u8() {
@@ -146,16 +156,36 @@ impl Wav {
                 }
                 WavData::I32(data)
             },
-            _ => return Err(WavLoadError::Parse(format!("Unexpected bits per sample value (got: \"{}\", expected 8, 16, or 32)", bits_per_sample))),
+            _ => return Err(WavLoadError::Parse(format!("Unexpected bits per sample value (got: \"{}\", expected 8, 16, or 32)", wav.bits_per_sample))),
         };
 
-        Ok(Wav { 
-            num_channels: num_channels, 
-            sample_rate: sample_rate, 
-            byte_rate:  byte_rate, 
-            block_align: block_align, 
-            bits_per_sample: bits_per_sample,
-            data: data_enum,
-        })
+        wav.data = data_enum;
+        Ok(())
+    }
+
+    fn buf_to_wav(buf: &[u8]) -> Result<Wav, WavLoadError> {
+        let mut wav = Wav::new();
+
+        let riff_chunk = Wav::parse_chunk(buf).unwrap();
+        wav_assert!(&riff_chunk.id == "RIFF", format!("Unsupported wave file (got: \"{}\", expected \"RIFF\")", &riff_chunk.id));
+        wav_assert!(riff_chunk.size as usize == buf.len() - 8, format!("Reported file size does not match actual size, {} vs {}", riff_chunk.size, buf.len()));
+
+        let file_type = str::from_utf8(&buf[CHUNK_DATA_OFFSET..CHUNK_DATA_OFFSET + 4]).unwrap();
+        wav_assert!(file_type == "WAVE", format!("Unsupported format (got: \"{}\", expected \"WAVE\")", file_type));
+
+        let mut offset = CHUNK_DATA_OFFSET + 4;
+        while let Some(chunk) = Wav::parse_chunk(&buf[offset..])
+        {
+            offset += CHUNK_DATA_OFFSET;
+            match &chunk.id[..] {
+                "fmt " => { Wav::parse_fmt_chunk_data(&buf[offset..], &mut wav); },
+                "LIST" => (), //TODO implement
+                "data" => { Wav::parse_data_chunk_data(&buf[offset..], &mut wav); },
+                _ => return Err(WavLoadError::Parse(format!("Unable to parse chunk with id: {}", chunk.id).to_string())),
+            }
+            offset += chunk.size as usize;
+        }
+
+        Ok(wav)
     }
 }
