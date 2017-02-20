@@ -6,3 +6,4 @@ authors = ["Roy van der Vegt <Royvandervegt@gmail.com>"]
 [dependencies]
 byteorder = "1.0.0"
 alsa = "0.1.4"
+framebuffer = "0.1.5"

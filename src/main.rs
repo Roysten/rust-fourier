@@ -1,7 +1,9 @@
 extern crate alsa;
 extern crate byteorder;
+extern crate framebuffer;
 
 mod wav_loader;
+mod fb;
 
 use std::env;
 use std::{u8, i16, i32};
@@ -13,6 +15,7 @@ use alsa::{Direction, ValueOr};
 use alsa::pcm::{PCM, HwParams, Format, Access};
 
 use wav_loader::{Wav, WavData};
+use fb::FbPainter;
 
 fn main() {
     let mut args = env::args();
@@ -37,18 +40,19 @@ fn main() {
     hwp.set_access(Access::RWInterleaved).unwrap();
     pcm.hw_params(&hwp).unwrap();
 
+    let mut painter = FbPainter::new();
     let mut io = pcm.io_f32().unwrap();
-    for chunk in samples.chunks(4096) {
-        let (c, s) = fft(chunk, chunk.len());
+    for chunk in samples.chunks(512) {
         io.writei(chunk);
+        let (c, s) = fft(chunk, chunk.len());
+
+        //Only use the real part, since imaginary is a duplicate
+        let mut magnitudes = Vec::new();
+        for i in 0 .. c.len() / 2 { 
+            magnitudes.push((c[i].powi(2) + s[i].powi(2)).sqrt() / (c.len() as f32 / 2.0));
+        }
+        painter.update(&magnitudes);
     }
-    
-    //dft(&samples[..], wav.sample_rate as usize / 2, wav.sample_rate);
-    //for i in 0 .. c.len() {
-        //println!("{} {}", i, (c[i].powi(2) + s[i].powi(2)).sqrt());
-        //println!("{} {}", i, c[i] + s[i]);
-        //println!("{} {} {}", i, c[i], s[i]);
-    //}
 }
 
 fn hanning_window(index: usize, total: usize) -> f32 {
